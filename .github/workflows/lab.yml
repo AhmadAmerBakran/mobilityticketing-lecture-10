@@ -1,0 +1,117 @@
+name: MongoDB lab
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'scripts/verify.js'
+      - 'compose.yaml'
+      - 'run.sh'
+      - 'scripts/runner.js'
+      - 'scripts/init.js'
+      - 'scripts/check.js'
+      - '.github/workflows/lab.yml'
+  workflow_dispatch:
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run experiments
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          trap 'bash run.sh down >/dev/null 2>&1 || true' EXIT
+          capture() {
+            local name="$1"
+            shift
+            set +e
+            bash run.sh "$@" > "results/${name}.json" 2>&1
+            local exit_code=$?
+            set -e
+            echo "${name}: ${exit_code}" >> results/exits.txt
+          }
+          primary_from() {
+            python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); print(next(m["name"].split(":")[0] for m in data["members"] if m["state"]=="PRIMARY"))' "$1"
+          }
+          has_primary() {
+            python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); sys.exit(0 if any(m["state"]=="PRIMARY" for m in data.get("members",[])) else 1)' "$1"
+          }
+          wait_for_primary() {
+            local member="$1"
+            for attempt in $(seq 1 30); do
+              bash run.sh status "$member" > results/poll.json 2>&1 || true
+              if has_primary results/poll.json; then return 0; fi
+              sleep 2
+            done
+            return 1
+          }
+          wait_for_no_primary() {
+            local member="$1"
+            for attempt in $(seq 1 30); do
+              bash run.sh status "$member" > results/poll.json 2>&1 || true
+              if ! has_primary results/poll.json; then return 0; fi
+              sleep 2
+            done
+            return 1
+          }
+
+          bash run.sh up > results/initial_up.txt 2>&1
+          capture baseline_status status mongo1
+          first_primary=$(primary_from results/baseline_status.json)
+          capture baseline_majority write BASE-MAJ majority
+          capture baseline_one write BASE-ONE 1
+          capture baseline_primary_read read BASE-MAJ primary
+          capture baseline_secondary_read read BASE-MAJ secondary
+
+          docker compose stop "$first_primary"
+          remaining=mongo1
+          if [ "$remaining" = "$first_primary" ]; then remaining=mongo2; fi
+          capture stopped_primary_read read BASE-MAJ secondary
+          capture failover_first write FAILOVER-01 majority
+          wait_for_primary "$remaining"
+          capture failover_status status "$remaining"
+          capture failover_second write FAILOVER-02 majority
+          capture ack_write write ACK-ALL 3
+          capture ack_read read ACK-ALL primary
+
+          docker compose start "$first_primary"
+          bash run.sh up > results/rejoin_up.txt 2>&1
+          capture restored_status status mongo1
+          second_primary=$(primary_from results/restored_status.json)
+          other_members=()
+          for member in mongo1 mongo2 mongo3; do
+            if [ "$member" != "$second_primary" ]; then other_members+=("$member"); fi
+          done
+          docker compose stop "${other_members[@]}"
+          wait_for_no_primary "$second_primary"
+          capture no_majority_status status "$second_primary"
+          capture no_majority_primary_read read BASE-MAJ primary
+          capture no_majority_secondary_read read BASE-MAJ secondary
+          capture no_majority_one write NO-MAJ-ONE 1
+          capture no_majority_majority write NO-MAJ-MAJ majority
+          capture no_majority_verify verify BASE-MAJ
+
+          docker compose start mongo1 mongo2 mongo3
+          bash run.sh up > results/recovery_up.txt 2>&1
+          capture recovered_status status mongo1
+          capture recovered_write write RECOVERED-01 majority
+          capture verification verify BASE-MAJ BASE-ONE FAILOVER-01 FAILOVER-02 ACK-ALL NO-MAJ-ONE NO-MAJ-MAJ RECOVERED-01 NEVER-SENT
+          capture check check
+
+      - name: Show results
+        if: always()
+        shell: bash
+        run: |
+          for file in results/*; do
+            echo "===== $file ====="
+            cat "$file"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mongodb-results
+          path: results/

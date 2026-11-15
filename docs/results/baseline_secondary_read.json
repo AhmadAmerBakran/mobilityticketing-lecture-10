@@ -1,0 +1,1 @@
+{"action":"read","operationId":"BASE-MAJ","startedAt":"2026-11-15T13:15:30.714Z","readPreference":"secondary","readConcern":"local","writeConcern":null,"retryWrites":false,"retryReads":false,"actual":{"_id":"BASE-MAJ","tripId":"T102","status":"Cancelled","sourceVersion":2},"outcome":"Present","finishedAt":"2026-11-15T13:15:30.778Z","durationMs":64}
